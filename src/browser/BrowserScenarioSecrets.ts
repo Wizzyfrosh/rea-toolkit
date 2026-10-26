@@ -7,8 +7,14 @@ import { createHash } from "node:crypto";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import type {
   BrowserScenarioUrl,
+  BrowserScenarioRequestValue,
   BrowserScenarioValue,
+  BrowserScenarioSaveEntry,
 } from "../domain/browserScenarioValues.js";
+import {
+  readResponseValues,
+  redactResponseSource,
+} from "./BrowserScenarioResponseValues.js";
 import {
   sanitizeBrowserUrl,
   type SanitizedBrowserUrl,
@@ -19,6 +25,9 @@ const REDACTION_PREFIX = "[REDACTED:";
 
 /** Page values shorter than this are not redacted: redacting them would rewrite ids, ports and hosts throughout the capture. */
 export const MIN_REDACTED_PAGE_VALUE_LENGTH = 8;
+
+/** The most saved-value text a scenario keeps at once, with the redaction spellings of values saved as secret: as much as one saved response can carry. */
+export const MAX_RETAINED_SAVED_CHARACTERS = 4_000_000;
 
 const encodedSecretValues = (secret: string): ReadonlySet<string> =>
   new Set([
@@ -74,6 +83,35 @@ const secretPatterns = (
     seen.add(key);
     return true;
   });
+};
+
+/** The code units a secret's redaction spellings keep, each distinct spelling once. */
+const spellingUnits = (secret: string): number =>
+  [
+    ...new Set(
+      [
+        ...secretPatterns(secret, "text"),
+        ...secretPatterns(secret, "url"),
+      ].flatMap(({ text, searchText }) => [text, searchText]),
+    ),
+  ].reduce((units, spelling) => units + spelling.length, 0);
+
+const URI_KEPT = /[\w.!~*'()-]/u;
+const FORM_KEPT = /[\w .*-]/u;
+
+/** A lower bound that refuses over-budget spellings before allocating encoded copies. */
+const leastSpellingUnits = (secret: string): number => {
+  let uri = 0;
+  let form = 0;
+  for (const character of secret) {
+    const point = character.codePointAt(0) ?? 0;
+    const escaped =
+      3 * (point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4);
+    uri += URI_KEPT.test(character) ? 1 : escaped;
+    form += FORM_KEPT.test(character) ? 1 : escaped;
+  }
+  const encoded = Math.max(uri, form);
+  return secret.length + (encoded > secret.length ? encoded : 0);
 };
 
 const declaredPatterns = (
@@ -238,6 +276,12 @@ export class BrowserScenarioSecrets {
   private textReplacements: readonly SecretReplacement[] = [];
   private textNeedles: readonly SecretNeedle[] = [];
   private redactionCostPerCharacter = 8;
+  private learnedSecrets = false;
+
+  /** Runtime redaction facts are independent of source request identity/readiness. */
+  hasLearnedSecrets(): boolean {
+    return this.learnedSecrets;
+  }
 
   private constructor(private readonly values: Map<string, string>) {
     this.compile();
@@ -273,16 +317,53 @@ export class BrowserScenarioSecrets {
    * {@link MIN_REDACTED_PAGE_VALUE_LENGTH} is not redacted.
    */
   admitPageValue(label: string, value: string): void {
-    // fetch sends a header value without surrounding spaces and tabs, so that is the spelling records hold.
+    this.retainValues(
+      label,
+      this.valuesToAdmit(value, MIN_REDACTED_PAGE_VALUE_LENGTH),
+    );
+  }
+
+  /** Build only bounded Basic text; all distinct encoded spellings share the saved-value budget. */
+  basicCredential(label: string, username: string, password: string): string {
+    const bytes = Buffer.byteLength(username) + 1 + Buffer.byteLength(password);
+    const encodedCharacters = 4 * Math.ceil(bytes / 3);
+    if (encodedCharacters > MAX_RETAINED_SAVED_CHARACTERS)
+      throw new Error(
+        `Basic credentials cannot be built: their encoded form exceeds ${String(MAX_RETAINED_SAVED_CHARACTERS)} characters.`,
+      );
+    const input = Buffer.allocUnsafe(bytes);
+    let offset = input.write(username);
+    offset += input.write(":", offset);
+    input.write(password, offset);
+    const encoded = input.toString("base64");
+    this.retainSavedRedactions(
+      label,
+      this.valuesToAdmit(encoded, 1),
+      this.savedUnits,
+      "Basic credentials",
+    );
+    return encoded;
+  }
+
+  /** Fetch trims surrounding header whitespace; both source and sent spellings remain owned here. */
+  private valuesToAdmit(value: string, shortest: number): readonly string[] {
     const sent = value.replace(/^[\t ]+|[\t ]+$/gu, "");
-    if (sent !== value) this.admitPageValue(label, sent);
-    if (value.length < MIN_REDACTED_PAGE_VALUE_LENGTH) return;
-    for (const held of this.values.values()) if (held === value) return;
-    let id = `page:${label}`;
-    for (let suffix = 2; this.values.has(id); suffix += 1)
-      id = `page:${label}~${String(suffix)}`;
-    this.values.set(id, value);
+    const held = new Set(this.values.values());
+    return [...new Set([sent, value])].filter(
+      (candidate) => candidate.length >= shortest && !held.has(candidate),
+    );
+  }
+
+  private retainValues(label: string, values: readonly string[]): void {
+    if (values.length === 0) return;
+    for (const value of values) {
+      let id = `page:${label}`;
+      for (let suffix = 2; this.values.has(id); suffix += 1)
+        id = `page:${label}~${String(suffix)}`;
+      this.values.set(id, value);
+    }
     this.compile();
+    this.learnedSecrets = true;
   }
 
   static resolve(
@@ -320,8 +401,165 @@ export class BrowserScenarioSecrets {
     return ok(new BrowserScenarioSecrets(values));
   }
 
-  value(source: BrowserScenarioValue): string {
+  /** Values steps saved from JSON responses, by name, as strings or numbers. */
+  private readonly saved = new Map<string, string | number>();
+
+  /** Code units the current saved values keep, and those the redaction spellings of secret saves keep for the rest of the scenario. */
+  private savedUnits = 0;
+  private secretSpellingUnits = 0;
+
+  /** Policies are attached before dispatch to the browser's exact request identity. */
+  private readonly responseSecrets = new WeakMap<
+    object,
+    {
+      readonly stepId: string;
+      readonly entries: readonly BrowserScenarioSaveEntry[];
+    }
+  >();
+
+  private readonly readyResponses = new WeakSet<object>();
+
+  responseSecretsReady(request: object): boolean {
+    return this.readyResponses.has(request);
+  }
+
+  markResponseSecretsReady(request: object): void {
+    this.readyResponses.add(request);
+  }
+
+  responseProtector(
+    stepId: string,
+    entries: readonly BrowserScenarioSaveEntry[],
+  ): ((request: object) => void) | undefined {
+    const sensitive = entries.filter((entry) => entry.secret);
+    if (sensitive.length === 0) return undefined;
+    const policy = { stepId, entries: sensitive };
+    return (request) => {
+      this.responseSecrets.set(request, policy);
+    };
+  }
+
+  hasResponseProtection(request: object): boolean {
+    return this.responseSecrets.has(request);
+  }
+
+  /** Redact the selected source fields before network Evidence can retain the body. */
+  admitResponseSecrets(
+    request: object,
+    body: Buffer,
+    retention?: {
+      readonly maxBytes: number;
+      readonly maxAllocationBytes: number;
+    },
+  ): Buffer {
+    const source = this.responseSecrets.get(request);
+    if (source === undefined) return body;
+    const selected = readResponseValues(body, source.entries, "ignore");
+    if (!selected.ok)
+      throw new Error(`Step ${source.stepId}: ${selected.error.message}`);
+    for (const { entry, value } of selected.value.values) {
+      const additions = this.valuesToAdmit(String(value), 1);
+      this.retainSavedRedactions(
+        `${source.stepId}.${entry.name}`,
+        additions,
+        this.savedUnits,
+        entry.name,
+      );
+    }
+    if (selected.value.values.length === source.entries.length)
+      this.markResponseSecretsReady(request);
+    if (retention === undefined) return body;
+    const redacted = redactResponseSource(
+      selected.value.text,
+      selected.value.values,
+      (value) => this.redact(value),
+      retention.maxBytes,
+      retention.maxAllocationBytes,
+    );
+    if (!redacted.ok) throw new Error(redacted.error.message);
+    return redacted.value ?? body;
+  }
+
+  /** Decode JSON only when redaction is active; other bytes retain their existing binary policy. */
+  redactJsonBody(
+    body: Buffer,
+    retention: {
+      readonly maxBytes: number;
+      readonly maxAllocationBytes: number;
+    },
+  ): Buffer {
+    if (body.length === 0 || this.textPatterns.length === 0) return body;
+    const text = new TextDecoder("utf-8", {
+      fatal: true,
+      ignoreBOM: true,
+    }).decode(body);
+    const redacted = redactResponseSource(
+      text,
+      [],
+      (value) => this.redact(value),
+      retention.maxBytes,
+      retention.maxAllocationBytes,
+    );
+    if (!redacted.ok) throw new Error(redacted.error.message);
+    return redacted.value ?? body;
+  }
+
+  private retainSavedRedactions(
+    label: string,
+    additions: readonly string[],
+    savedUnits: number,
+    name: string,
+  ): void {
+    const available =
+      MAX_RETAINED_SAVED_CHARACTERS - savedUnits - this.secretSpellingUnits;
+    const minimum = additions.reduce(
+      (units, value) => units + leastSpellingUnits(value),
+      0,
+    );
+    const spellings =
+      minimum > available
+        ? minimum
+        : additions.reduce((units, value) => units + spellingUnits(value), 0);
+    if (available < 0 || spellings > available)
+      throw new Error(
+        `${name} cannot be saved: the scenario would keep more than ${String(MAX_RETAINED_SAVED_CHARACTERS)} characters of saved values.`,
+      );
+    this.secretSpellingUnits += spellings;
+    this.retainValues(label, additions);
+  }
+
+  /** Keep a value a step saved from a JSON response; a secret one is redacted from everything recorded after it. Refused before it is kept when the scenario would hold more than {@link MAX_RETAINED_SAVED_CHARACTERS}. */
+  save(
+    label: string,
+    name: string,
+    value: string | number,
+    secret: boolean,
+  ): void {
+    const text = String(value);
+    const replaced = this.saved.get(name);
+    const savedUnits =
+      this.savedUnits -
+      (replaced === undefined ? 0 : String(replaced).length) +
+      text.length;
+    const available =
+      MAX_RETAINED_SAVED_CHARACTERS - savedUnits - this.secretSpellingUnits;
+    const additions =
+      secret && available >= 0 ? this.valuesToAdmit(text, 1) : [];
+    this.retainSavedRedactions(label, additions, savedUnits, name);
+    this.saved.set(name, value);
+    this.savedUnits = savedUnits;
+  }
+
+  /** A saved value with the JSON type it was saved with. */
+  savedValue(name: string): string | number {
+    const value = this.saved.get(name);
+    if (value === undefined) throw new Error(`No earlier step saved ${name}`);
+    return value;
+  }
+
+  value(source: BrowserScenarioValue | BrowserScenarioRequestValue): string {
     if (source.source === "literal") return source.value;
+    if (source.source === "saved") return String(this.savedValue(source.name));
     const value = this.values.get(source.secret_id);
     if (value === undefined)
       throw new Error("Validated browser secret was not resolved");
