@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import type { BrowserScenario } from "../domain/browserScenario.js";
 import type {
   BrowserScenarioUrl,
+  BrowserScenarioRequestValue,
   BrowserScenarioValue,
 } from "../domain/browserScenarioValues.js";
 import {
@@ -20,11 +21,18 @@ const REDACTION_PREFIX = "[REDACTED:";
 /** Page values shorter than this are not redacted: redacting them would rewrite ids, ports and hosts throughout the capture. */
 export const MIN_REDACTED_PAGE_VALUE_LENGTH = 8;
 
-const encodedSecretValues = (secret: string): ReadonlySet<string> =>
-  new Set([
-    encodeURIComponent(secret),
+/** The most saved-value text a scenario keeps at once, with the redaction spellings of values saved as secret: as much as one saved response can carry. */
+export const MAX_RETAINED_SAVED_CHARACTERS = 4_000_000;
+
+const encodedSecretValues = (secret: string): ReadonlySet<string> => {
+  const component = encodeURIComponent(secret);
+  return new Set([
+    component,
+    // A URL's query, as fetch and the browser parse it, also escapes the `'` the component kept.
+    component.replace(/'/gu, "%27"),
     new URLSearchParams([["value", secret]]).toString().slice("value=".length),
   ]);
+};
 
 type SecretSpellings = "url" | "text";
 interface SecretPattern {
@@ -74,6 +82,46 @@ const secretPatterns = (
     seen.add(key);
     return true;
   });
+};
+
+/** The code units a secret's redaction spellings keep, each distinct spelling once. */
+const spellingUnits = (secret: string): number =>
+  [
+    ...new Set(
+      [
+        ...secretPatterns(secret, "text"),
+        ...secretPatterns(secret, "url"),
+      ].flatMap(({ text, searchText }) => [text, searchText]),
+    ),
+  ].reduce((units, spelling) => units + spelling.length, 0);
+
+/** Characters encodeURIComponent keeps as they are, and those the form encoder keeps (a space it spells `+`). */
+const URI_KEPT = /[\w.!~*'()-]/u;
+const FORM_KEPT = /[\w .*-]/u;
+
+/** The length percent-encoding `value` gives, keeping the characters `kept` matches, counted without building it. */
+const encodedLength = (value: string, kept: RegExp): number => {
+  let units = 0;
+  for (const character of value) {
+    const point = character.codePointAt(0) ?? 0;
+    units += kept.test(character)
+      ? 1
+      : 3 * (point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4);
+  }
+  return units;
+};
+
+/** The length encodeURIComponent gives `value`, counted without building it. */
+export const uriComponentLength = (value: string): number =>
+  encodedLength(value, URI_KEPT);
+
+/** A lower bound on {@link spellingUnits}, counted without building a spelling: the secret, and its longer percent-encoded spelling when that is longer than it. */
+const leastSpellingUnits = (secret: string): number => {
+  const encoded = Math.max(
+    uriComponentLength(secret),
+    encodedLength(secret, FORM_KEPT),
+  );
+  return secret.length + (encoded > secret.length ? encoded : 0);
 };
 
 const declaredPatterns = (
@@ -273,10 +321,19 @@ export class BrowserScenarioSecrets {
    * {@link MIN_REDACTED_PAGE_VALUE_LENGTH} is not redacted.
    */
   admitPageValue(label: string, value: string): void {
+    this.admit(label, value, MIN_REDACTED_PAGE_VALUE_LENGTH);
+  }
+
+  /** Redact a credential a step built or a value it saved as secret from everything recorded after it, whatever its length, as a declared secret is. */
+  admitCredential(label: string, value: string): void {
+    this.admit(label, value, 1);
+  }
+
+  private admit(label: string, value: string, shortest: number): void {
     // fetch sends a header value without surrounding spaces and tabs, so that is the spelling records hold.
     const sent = value.replace(/^[\t ]+|[\t ]+$/gu, "");
-    if (sent !== value) this.admitPageValue(label, sent);
-    if (value.length < MIN_REDACTED_PAGE_VALUE_LENGTH) return;
+    if (sent !== value) this.admit(label, sent, shortest);
+    if (value.length < shortest) return;
     for (const held of this.values.values()) if (held === value) return;
     let id = `page:${label}`;
     for (let suffix = 2; this.values.has(id); suffix += 1)
@@ -320,8 +377,67 @@ export class BrowserScenarioSecrets {
     return ok(new BrowserScenarioSecrets(values));
   }
 
-  value(source: BrowserScenarioValue): string {
+  /** Values steps saved from JSON responses, by name, as strings or numbers. */
+  private readonly saved = new Map<string, string | number>();
+
+  /** Code units the current saved values keep, and those the redaction spellings of secret saves keep for the rest of the scenario. */
+  private savedUnits = 0;
+  private secretSpellingUnits = 0;
+
+  /** Keep a value a step saved from a JSON response; a secret one is redacted from everything recorded after it. Refused before it is kept when the scenario would hold more than {@link MAX_RETAINED_SAVED_CHARACTERS}. */
+  save(
+    label: string,
+    name: string,
+    value: string | number,
+    secret: boolean,
+  ): void {
+    const text = String(value);
+    const replaced = this.saved.get(name);
+    const savedUnits =
+      this.savedUnits -
+      (replaced === undefined ? 0 : String(replaced).length) +
+      text.length;
+    let kept = savedUnits + this.secretSpellingUnits;
+    const spellings =
+      secret && kept <= MAX_RETAINED_SAVED_CHARACTERS
+        ? this.admittedSpellingUnits(text, MAX_RETAINED_SAVED_CHARACTERS - kept)
+        : 0;
+    kept += spellings;
+    if (kept > MAX_RETAINED_SAVED_CHARACTERS)
+      throw new Error(
+        `${name} cannot be saved: the scenario would keep more than ${String(MAX_RETAINED_SAVED_CHARACTERS)} characters of saved values.`,
+      );
+    this.saved.set(name, value);
+    this.savedUnits = savedUnits;
+    this.secretSpellingUnits += spellings;
+    if (secret) this.admitCredential(label, text);
+  }
+
+  /** The code units of the redaction spellings admitting `value` as a credential adds: it and its trimmed spelling, each unless already held. Past `room`, only a lower bound, so no spelling is built that could not be kept. */
+  private admittedSpellingUnits(value: string, room: number): number {
+    const held = new Set(this.values.values());
+    const added = [
+      ...new Set([value.replace(/^[\t ]+|[\t ]+$/gu, ""), value]),
+    ].filter((candidate) => candidate.length > 0 && !held.has(candidate));
+    const least = added.reduce(
+      (units, candidate) => units + leastSpellingUnits(candidate),
+      0,
+    );
+    return least > room
+      ? least
+      : added.reduce((units, candidate) => units + spellingUnits(candidate), 0);
+  }
+
+  /** A saved value with the JSON type it was saved with. */
+  savedValue(name: string): string | number {
+    const value = this.saved.get(name);
+    if (value === undefined) throw new Error(`No earlier step saved ${name}`);
+    return value;
+  }
+
+  value(source: BrowserScenarioValue | BrowserScenarioRequestValue): string {
     if (source.source === "literal") return source.value;
+    if (source.source === "saved") return String(this.savedValue(source.name));
     const value = this.values.get(source.secret_id);
     if (value === undefined)
       throw new Error("Validated browser secret was not resolved");
