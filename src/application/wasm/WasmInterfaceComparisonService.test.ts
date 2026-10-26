@@ -164,6 +164,33 @@ it("requires the producer's file subject format even for authentic Evidence", as
   ).toMatchObject({ ok: false, error: { _tag: "AnalysisInputError" } });
 });
 
+it("names the argument whose Evidence is rejected", async () => {
+  const tampered = JSON.parse(JSON.stringify(evidence(facts("f"))));
+  tampered.normalized_result.interface.entries[0].name = "tampered";
+  expect(
+    await compareWasmInterfaces({
+      left: evidence(facts("f")),
+      right: tampered,
+      scope: "both",
+    }),
+  ).toMatchObject({
+    ok: false,
+    error: { issues: [{ path: ["right"], reason: "invalid_value" }] },
+  });
+  const rebound = JSON.parse(JSON.stringify(evidence(facts("f"))));
+  rebound.subject.local_path = "/other.wasm";
+  expect(
+    await compareWasmInterfaces({
+      left: rebound,
+      right: evidence(facts("f")),
+      scope: "both",
+    }),
+  ).toMatchObject({
+    ok: false,
+    error: { issues: [{ path: ["left"], reason: "invalid_value" }] },
+  });
+});
+
 it("resolves exact retained references and permits cancellation between comparison batches", async () => {
   const left = evidence(facts("f"));
   const right = evidence(facts("f", "i64"));
