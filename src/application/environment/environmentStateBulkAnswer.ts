@@ -32,6 +32,7 @@ import {
   generator,
   observedEntity,
   pathValues,
+  sortedOrder,
   unloadable,
   heldEntity,
   updateTarget,
@@ -183,7 +184,17 @@ export const answerBulk = (
   );
   if (!answer.ok) return answer;
   if (update) {
-    const updated = serving.store.updateAll(written.value);
+    const updated = serving.store.updateAll(
+      written.value,
+      sortedOrder(
+        serving,
+        plan,
+        written.value.map((after, index) => ({
+          before: targets.value[index]!.entity,
+          after,
+        })),
+      ),
+    );
     if (!updated.ok) return updated;
   } else serving.store.removeAll(written.value);
   serving.store.commitWrite(values.taken);

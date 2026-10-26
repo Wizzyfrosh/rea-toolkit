@@ -12,15 +12,17 @@ import {
   scalarText,
   type JsonObject,
   type StateEntity,
+  type StateView,
 } from "./environmentStateRules.js";
-import type {
-  FieldRule,
-  GeneratedRule,
-  JsonKind,
-  StateWritePlan,
-  WriteBody,
-  WriteCall,
-  WriteResponse,
+import {
+  emptySpellings,
+  type FieldRule,
+  type GeneratedRule,
+  type JsonKind,
+  type StateWritePlan,
+  type WriteBody,
+  type WriteCall,
+  type WriteResponse,
 } from "./environmentStateWriteRules.js";
 import {
   stampProblem,
@@ -148,6 +150,13 @@ export const bodyProblem = (
     }
     if (!body.accepted.includes(member))
       return `Member ${member} is not one the capture showed stored (${bodyContract(body)}).`;
+    // A recorded call sent this member empty, as a form does for a field left as it was.
+    if (
+      body.blank?.some(
+        (entry) => entry.member === member && same(entry.sent, value),
+      ) === true
+    )
+      continue;
     const recorded = ownMember(shapes.entity, member);
     const kind =
       recorded === undefined || recorded === null
@@ -320,15 +329,36 @@ const copiedShapes = (
     }),
   );
 
+/** A create's call with the members it left out that recorded calls sent empty, as the earliest sent them; one a call that left it out showed a default for keeps that default. */
+const withBlanks = (body: WriteBody, call: WriteCall): WriteCall => {
+  const given = call.body ?? {};
+  const left = (body.blank ?? []).filter(
+    ({ member }, index, blank) =>
+      !Object.hasOwn(given, member) &&
+      !(body.defaults ?? []).some((entry) => entry.member === member) &&
+      blank.findIndex((entry) => entry.member === member) === index,
+  );
+  return left.length === 0
+    ? call
+    : {
+        ...call,
+        body: {
+          ...Object.fromEntries(left.map(({ member, sent }) => [member, sent])),
+          ...given,
+        },
+      };
+};
+
 /** The fields of a created entity: the observed entity with every ruled field taken from the call or generated. */
 export const createdFields = (
   plan: Pick<StateWritePlan, "rules" | "body">,
   observed: JsonObject,
-  call: WriteCall,
+  sentCall: WriteCall,
   generate: GenerateValue,
   referenced?: ReferencedEntity,
 ): Applied<JsonObject> => {
   if (plan.body === null) return err("The tool has no modelled body.");
+  const call = withBlanks(plan.body, sentCall);
   const problem = bodyProblem(plan.body, call, {
     entity: { ...copiedShapes(plan.rules, observed), ...observed },
   });
@@ -491,6 +521,27 @@ export const optionalFields = (
   );
 };
 
+/** Fields an item view of the type shows that no initial entity of the type holds, which only later reads showed. */
+export const laterItemFields = (
+  views: Iterable<StateView>,
+  entities: readonly StateEntity[],
+  type: string | null,
+): Set<string> => {
+  const fields = new Set<string>();
+  for (const view of views)
+    if (view.shape === "item" && view.type === type)
+      for (const field of view.fields)
+        if (!view.required_fields.includes(field)) fields.add(field);
+  for (const entity of entities)
+    if (entity.type === type)
+      for (const held of [
+        entity.fields,
+        ...entity.view_fields.map((view) => view.fields),
+      ])
+        for (const field of Object.keys(held)) fields.delete(field);
+  return fields;
+};
+
 /** A write's answer body from its recorded response: the entity or identity rendered in, nothing, or the recorded body; optional fields show only when written. */
 export const writtenResponse = (
   response: WriteResponse,
@@ -502,6 +553,8 @@ export const writtenResponse = (
     readonly clocks?: readonly string[];
   },
   optional: readonly string[] = [],
+  /** Fields only later reads showed, which the answer leaves out when the entity does not hold them. */
+  later: ReadonlySet<string> = new Set(),
 ): Applied<JsonValue | undefined> => {
   if (response.shape === "empty") return ok(undefined);
   if (response.shape === "recorded" || recorded === undefined)
@@ -522,7 +575,7 @@ export const writtenResponse = (
     return err("The recorded response does not carry the entity.");
   const held = (field: string) => Object.hasOwn(written.fields!, field);
   const missing = Object.keys(shown).filter(
-    (field) => !held(field) && !optional.includes(field),
+    (field) => !held(field) && !optional.includes(field) && !later.has(field),
   );
   if (missing.length > 0)
     return err(
@@ -539,9 +592,13 @@ export const writtenResponse = (
       Object.fromEntries(
         fields.map((field) => {
           const value = ownMember(written.fields!, field)!;
+          const answered = ownMember(shown, field);
+          // An answer spells an empty list or map as its recording did, whichever spelling the state holds.
+          if (answered !== undefined && emptySpellings(answered, value))
+            return [field, answered];
           const clock =
             written.clocks?.includes(field) === true
-              ? readClock(ownMember(shown, field))
+              ? readClock(answered)
               : undefined;
           return [
             field,
